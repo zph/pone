@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Usage: pone [signin|get|set|get-by-id]
+# Summary: a one-password based SSH Private Key source tool and load into ssh-agent
+#   Workflow
+#   - signin (automated)
+#   # Store key in 1p
+#   - set ssh key pone set ~/.ssh/id_ed25519
+#   # Fetch key from 1p
+#   - get ssh key pone set ~/.ssh/id_ed25519
+#   # Fetch key from 1p and set in ssh-agent
+#   - pone get-then-ssh-add ~/.ssh/id_ed25519
+#   # TODO allow mechanism for unlockinging ssh privkey for password protected keys
+
+set -eou pipefail
+
+# CONFIG
+readonly ACCOUNT="my"
+
+# Per docs, session is good until 30 min of inactivity occurs
+readonly SESSION="$HOME/.ssh/op.session"
+
+pone/session() {
+  if [ -f "$SESSION" ];then
+    cat "$SESSION"
+  fi
+}
+
+pone/signin() {
+  # Output session to OP_SESSION_my
+  # TODO make this work for either checking creds or getting new token
+  if [ ! -f "$SESSION" ];then
+    touch "$SESSION"
+  fi
+  chmod 600 "$SESSION"
+  local sess=""
+  sess="$(pone/session | tr -d '"' | awk -F '=' '{print $2}')"
+  op signin "$ACCOUNT" --session "$sess" > "$SESSION"
+}
+
+pone/set() {
+  vault="keys"
+  local priv_key_path="$1"
+  # TODO: check to make sure the file coming in is private key path
+  # Code assumes that pub key is private_key + .pub
+  local key_basename="$(basename "$priv_key_path")"
+  local public_key="$(base64 < "$priv_key_path.pub")"
+  local private_key="$(base64 < "$priv_key_path")"
+  # Get short fingerprint of pub
+  local fingerprint="$(ssh-keygen -l -f "$priv_key_path.pub" | awk '{print $2}' | cut -c1-15)"
+  local title="$fingerprint:$(whoami)@$(uname -n):$key_basename"
+  local user_host="$(whoami)@$(uname -n)"
+  local tags="ssh_key,ssh,$user_host,$key_basename,$fingerprint"
+
+  # LOGIN item template
+  readonly content="{\"fields\": [
+    {\"designation\":\"username\",\"name\":\"username\",\"type\":\"T\",\"value\":\"$public_key\"},
+    {\"designation\":\"password\",\"name\":\"password\",\"type\":\"P\",\"value\":\"$private_key\"}],
+    \"notesPlain\":\"$priv_key_path\",
+    \"passwordHistory\":[],
+    \"sections\":[]}"
+
+  op create item \
+    --vault "$vault" \
+    --title "$title" \
+    --tags "$tags" "Login" "$(op encode <<< $content)"
+}
+
+pone/get() {
+  local vault="$1"
+  # Get all items in keys then for each get pub/priv key, decode from base64 (manually done by me when inserting)
+  op \
+    list items \
+    --vault keys | op get item - \
+    --fields password | base64 --decode
+}
+
+pone/get-by-id() {
+  local priv_key_path="$1"
+  local fingerprint
+  fingerprint="$(ssh-keygen -l -f "$priv_key_path.pub" | awk '{print $2}' | cut -c1-15)"
+  op list items \
+    --vault keys \
+    --tags "$fingerprint" \
+    | op get item - --fields password \
+    | base64 --decode
+}
+
+pone/ssh-add() {
+  local ssh_private_key="$1"
+  /usr/local/bin/ssh-add -t "${HOURS:-1}H" - <<< "${ssh_private_key}"
+}
+
+pone/get-then-ssh-add() {
+  local vault="$1"
+  local ssh_private_key
+  ssh_private_key="$(pone/get "$vault")"
+  pone/ssh-add "$ssh_private_key"
+}
+
+main() {
+  local cmd="$1"
+  shift
+  local rest="$*"
+  if [ -f "$SESSION" ];then
+    source "$SESSION"
+  fi
+  case "$cmd" in
+    "signin")
+      # skip autosignin attempt
+      ;;
+    *)
+      pone/signin
+      ;;
+  esac
+  "pone/${cmd}" "$rest"
+}
+
+main "$@"
